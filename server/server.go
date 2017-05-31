@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	proxyproto "github.com/armon/go-proxyproto"
 	"github.com/codegangsta/negroni"
 	"github.com/containous/mux"
 	"github.com/containous/traefik/cluster"
@@ -66,6 +68,24 @@ type serverRoute struct {
 	stripPrefixesRegex []string
 	addPrefix          string
 	replacePath        string
+}
+
+// tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
+// connections. It's used by ListenAndServe and ListenAndServeTLS so
+// dead TCP connections (e.g. closing laptop mid-download) eventually
+// go away.
+type tcpKeepAliveListener struct {
+	*net.TCPListener
+}
+
+func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
+	tc, err := ln.AcceptTCP()
+	if err != nil {
+		return
+	}
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(3 * time.Minute)
+	return tc, nil
 }
 
 // NewServer returns an initialized Server.
@@ -206,6 +226,12 @@ func (server *Server) startHTTPServers() {
 		if server.globalConfiguration.EntryPoints[newServerEntryPointName].Compress {
 			serverMiddlewares = append(serverMiddlewares, &middlewares.Compress{})
 		}
+		// if server.globalConfiguration.EntryPoints[newServerEntryPointName].ProxyProtocol {
+		// newServerEntryPoint.httpServer
+
+		// proxyProtocol := middlewares.NewProxyProtocolParser()
+		// serverMiddlewares = append(serverMiddlewares, proxyProtocol.Handler)
+		// }
 		newsrv, err := server.prepareServer(newServerEntryPointName, newServerEntryPoint.httpRouter, server.globalConfiguration.EntryPoints[newServerEntryPointName], serverMiddlewares...)
 		if err != nil {
 			log.Fatal("Error preparing server: ", err)
@@ -502,14 +528,29 @@ func (server *Server) createTLSConfig(entryPointName string, tlsOption *TLS, rou
 func (server *Server) startServer(srv *http.Server, globalConfiguration GlobalConfiguration) {
 	log.Infof("Starting server on %s", srv.Addr)
 	var err error
+
 	if srv.TLSConfig != nil {
 		err = srv.ListenAndServeTLS("", "")
 	} else {
-		err = srv.ListenAndServe()
+		err = server.listenAndServeRequest(srv, globalConfiguration)
 	}
 	if err != nil {
 		log.Error("Error creating server: ", err)
 	}
+}
+
+func (server *Server) listenAndServeRequest(srv *http.Server, globalConfiguration GlobalConfiguration) error {
+	addr := srv.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	proxyList := &proxyproto.Listener{Listener: ln.(*net.TCPListener)}
+
+	return srv.Serve(tcpKeepAliveListener{proxyList})
 }
 
 func (server *Server) prepareServer(entryPointName string, router *middlewares.HandlerSwitcher, entryPoint *EntryPoint, middlewares ...negroni.Handler) (*http.Server, error) {
